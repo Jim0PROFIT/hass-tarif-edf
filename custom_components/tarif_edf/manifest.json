@@ -2,12 +2,11 @@
   "domain": "tarif_edf",
   "name": "Tarif EDF",
   "codeowners": [
-    "@delphiki",
-    "@FigurinePanda43"
+    "@Jim0PROFIT"
   ],
   "config_flow": true,
-  "documentation": "https://github.com/FigurinePanda43/hass-tarif-edf",
+  "documentation": "https://github.com/Jim0PROFIT/hass-tarif-edf",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/FigurinePanda43/hass-tarif-edf/issues",
-  "version": "2.3.2"
+  "issue_tracker": "https://github.com/Jim0PROFIT/hass-tarif-edf/issues",
+  "version": "2.3.3"
 }
