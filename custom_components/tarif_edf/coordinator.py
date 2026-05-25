@@ -38,23 +38,30 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+
 def get_remote_file(url: str):
-    return requests.get(
+    """Fetch remote file with timeout."""
+    resp = requests.get(
         url,
-        stream=True,
+        timeout=10,
         headers={
             "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/51.0.2704.103 Safari/537.36"
         },
     )
+    resp.raise_for_status()
+    return resp
+
 
 def str_to_time(str):
     return datetime.strptime(str, '%H:%M').time()
+
 
 def time_in_between(now, start, end):
     if start <= end:
         return start <= now < end
     else:
         return start <= now or now < end
+
 
 def get_tempo_color_from_code(code):
     return TEMPO_COLORS_MAPPING[code]
@@ -123,36 +130,47 @@ class TarifEdfDataUpdateCoordinator(TimestampDataUpdateCoordinator):
         await self._store.async_save(cache_data)
         self.logger.debug(f"Cache Tempo sauvegardé: {cache_data}")
 
-    async def get_tempo_day(self, date):
-        date_str = date.strftime('%Y-%m-%d')
+    async def get_tempo_day(self, target_date: date) -> dict[str, Any]:
+        """Get tempo color for a given date, using tempo.today/tomorrow if possible."""
+        date_str = target_date.strftime('%Y-%m-%d')
         now = dt_util.now().time()
         check_limit = str_to_time(TEMPO_TOMRROW_AVAILABLE_AT)
 
         cached = self.tempo_prices.get(date_str)
         if cached is not None:
-            codeJour = cached['codeJour']
-            # Use cache if color is known, or if indéterminé and before the recheck limit
+            codeJour = cached.get("codeJour", 0)
             if codeJour in [1, 2, 3] or (codeJour == 0 and now < check_limit):
                 return cached
 
-        url = f"{TEMPO_COLOR_API_URL}/{date_str}"
+        today = dt_util.now().date()
+        tomorrow = today + timedelta(days=1)
+
+        if target_date == today:
+            url = "https://www.api-couleur-tempo.fr/api/jourTempo/today"
+        elif target_date == tomorrow:
+            url = "https://www.api-couleur-tempo.fr/api/jourTempo/tomorrow"
+        else:
+            # fallback to legacy /{date} if supported
+            url = f"https://www.api-couleur-tempo.fr/api/jourTempo/{date_str}"
+
+        _LOGGER.warning("tarif_edf fetching tempo day URL: %s", url)
         response = await self.hass.async_add_executor_job(get_remote_file, url)
-        response_json = response.json()
+        resp_json = response.json()  # will raise if malformed
 
-        # Only overwrite cache if new result has a known color, or no cache exists
-        if cached is None or response_json.get('codeJour', 0) in [1, 2, 3]:
-            self.tempo_prices[date_str] = response_json
+        if cached is None or resp_json.get("codeJour", 0) in [1, 2, 3]:
+            self.tempo_prices[date_str] = resp_json
 
-        return response_json
+        return resp_json
 
     async def get_tempo_forecast(self) -> list:
-        """Récupère les prévisions Tempo depuis open-dpe.fr (mis en cache 1h)."""
+        """Récupère les prévisions Tempo depuis open‑dpe.fr (mis en cache 1h)."""
         now = dt_util.now()
-        if self._forecast_cache and self._forecast_cache_time and \
-                (now - self._forecast_cache_time).total_seconds() < 3600:
+        if self._forecast_cache and self._forecast_cache_time \
+                and (now - self._forecast_cache_time).total_seconds() < 3600:
             return self._forecast_cache
 
         try:
+            _LOGGER.warning("tarif_edf fetching tempo forecast URL: %s", TEMPO_FORECAST_API_URL)
             response = await self.hass.async_add_executor_job(
                 get_remote_file, TEMPO_FORECAST_API_URL
             )
@@ -160,20 +178,23 @@ class TarifEdfDataUpdateCoordinator(TimestampDataUpdateCoordinator):
                 forecast_data = response.json()
                 if not isinstance(forecast_data, list):
                     self.logger.warning(
-                        f"Réponse prévisions Tempo inattendue (type={type(forecast_data).__name__})"
+                        "Réponse prévisions Tempo inattendue "
+                        "(type=%s)", type(forecast_data).__name__
                     )
                     return []
-                self.logger.debug(f"Prévisions Tempo récupérées: {len(forecast_data)} jours")
+                self.logger.debug("Prévisions Tempo récupérées: %d jours", len(forecast_data))
                 self._forecast_cache = forecast_data
                 self._forecast_cache_time = now
                 return forecast_data
             else:
                 self.logger.warning(
-                    f"Erreur lors de la récupération des prévisions Tempo: {response.status_code}"
+                    "Erreur lors de la récupération des prévisions Tempo: %d",
+                    response.status_code
                 )
                 return self._forecast_cache or []
         except Exception as e:
-            self.logger.error(f"Exception lors de la récupération des prévisions Tempo: {e}")
+            self.logger.error("Exception lors de la récupération "
+                              "des prévisions Tempo: %s", e)
             return self._forecast_cache or []
 
     async def _async_update_data(self) -> dict[Platform, dict[str, Any]]:
@@ -182,126 +203,147 @@ class TarifEdfDataUpdateCoordinator(TimestampDataUpdateCoordinator):
         previous_data = None if self.data is None else self.data.copy()
 
         # Charger le cache Tempo depuis le stockage persistant au premier démarrage
-        if data['contract_type'] == CONTRACT_TYPE_TEMPO:
+        if data["contract_type"] == CONTRACT_TYPE_TEMPO:
             await self._async_load_tempo_cache()
 
         if previous_data is None:
             # Préserver les données du cache si elles existent
-            cached_tempo_demain_date = self.data.get('tempo_demain_date') if self.data else None
-            cached_tempo_couleur_demain = self.data.get('tempo_couleur_demain') if self.data else None
-            cached_tempo_aujourdhui_date = self.data.get('tempo_aujourdhui_date') if self.data else None
-            cached_tempo_couleur_aujourdhui = self.data.get('tempo_couleur_aujourdhui') if self.data else None
+            cached_tempo_demain_date = self.data.get("tempo_demain_date") if self.data else None
+            cached_tempo_couleur_demain = self.data.get("tempo_couleur_demain") if self.data else None
+            cached_tempo_aujourdhui_date = self.data.get("tempo_aujourdhui_date") if self.data else None
+            cached_tempo_couleur_aujourdhui = self.data.get("tempo_couleur_aujourdhui") if self.data else None
 
             self.data = {
-                "contract_power": data['contract_power'],
-                "contract_type": data['contract_type'],
+                "contract_power": data["contract_power"],
+                "contract_type": data["contract_type"],
                 "last_refresh_at": None,
                 "tarif_actuel_ttc": None
             }
 
             # Restaurer les données du cache
             if cached_tempo_demain_date:
-                self.data['tempo_demain_date'] = cached_tempo_demain_date
-                self.data['tempo_couleur_demain'] = cached_tempo_couleur_demain
+                self.data["tempo_demain_date"] = cached_tempo_demain_date
+                self.data["tempo_couleur_demain"] = cached_tempo_couleur_demain
             if cached_tempo_aujourdhui_date:
-                self.data['tempo_aujourdhui_date'] = cached_tempo_aujourdhui_date
-                self.data['tempo_couleur_aujourdhui'] = cached_tempo_couleur_aujourdhui
+                self.data["tempo_aujourdhui_date"] = cached_tempo_aujourdhui_date
+                self.data["tempo_couleur_aujourdhui"] = cached_tempo_couleur_aujourdhui
 
-        fresh_data_limit = dt_util.now() - timedelta(days=self.config_entry.options.get("refresh_interval", DEFAULT_REFRESH_INTERVAL))
+        fresh_data_limit = dt_util.now() - timedelta(
+            days=self.config_entry.options.get("refresh_interval", DEFAULT_REFRESH_INTERVAL)
+        )
 
-        tarif_needs_update = self.data['last_refresh_at'] is None or self.data['last_refresh_at'] < fresh_data_limit
+        tarif_needs_update = (
+            self.data["last_refresh_at"] is None
+            or self.data["last_refresh_at"] < fresh_data_limit
+        )
 
-        self.logger.info('EDF tarif_needs_update '+('yes' if tarif_needs_update else 'no'))
+        self.logger.info("EDF tarif_needs_update %s", "yes" if tarif_needs_update else "no")
 
         if tarif_needs_update:
-            if data['contract_type'] == CONTRACT_TYPE_BASE:
+            if data["contract_type"] == CONTRACT_TYPE_BASE:
                 url = TARIF_BASE_URL
-            elif data['contract_type'] == CONTRACT_TYPE_HPHC:
-                    url = TARIF_HPHC_URL
-            elif data['contract_type'] == CONTRACT_TYPE_TEMPO:
-                    url = TARIF_TEMPO_URL
+            elif data["contract_type"] == CONTRACT_TYPE_HPHC:
+                url = TARIF_HPHC_URL
+            elif data["contract_type"] == CONTRACT_TYPE_TEMPO:
+                url = TARIF_TEMPO_URL
 
+            self.logger.warning("tarif_edf fetching tarif data URL: %s", url)
             response = await self.hass.async_add_executor_job(get_remote_file, url)
-            parsed_content = csv.reader(response.content.decode('utf-8').splitlines(), delimiter=';')
+            decoded = response.content.decode("utf-8")
+            parsed_content = csv.reader(decoded.splitlines(), delimiter=";")
             rows = list(parsed_content)
 
             for row in rows:
-                if row[1] == '' and row[2] == data['contract_power']:
-                    if data['contract_type'] == CONTRACT_TYPE_BASE:
-                        self.data['base_fixe_ttc'] = float(row[4].replace(",", "." ))
-                        self.data['base_variable_ttc'] = float(row[6].replace(",", "." ))
-                    elif data['contract_type'] == CONTRACT_TYPE_HPHC:
-                        self.data['hphc_fixe_ttc'] = float(row[4].replace(",", "." ))
-                        self.data['hphc_variable_hc_ttc'] = float(row[6].replace(",", "." ))
-                        self.data['hphc_variable_hp_ttc'] = float(row[8].replace(",", "." ))
-                    elif data['contract_type'] == CONTRACT_TYPE_TEMPO:
-                        self.data['tempo_fixe_ttc'] = float(row[4].replace(",", "." ))
-                        self.data['tempo_variable_hc_bleu_ttc'] = float(row[6].replace(",", "." ))
-                        self.data['tempo_variable_hp_bleu_ttc'] = float(row[8].replace(",", "." ))
-                        self.data['tempo_variable_hc_blanc_ttc'] = float(row[10].replace(",", "." ))
-                        self.data['tempo_variable_hp_blanc_ttc'] = float(row[12].replace(",", "." ))
-                        self.data['tempo_variable_hc_rouge_ttc'] = float(row[14].replace(",", "." ))
-                        self.data['tempo_variable_hp_rouge_ttc'] = float(row[16].replace(",", "." ))
+                if row[1] == "" and row[2] == data["contract_power"]:
+                    if data["contract_type"] == CONTRACT_TYPE_BASE:
+                        self.data["base_fixe_ttc"] = float(row[4].replace(",", "."))
+                        self.data["base_variable_ttc"] = float(row[6].replace(",", "."))
+                    elif data["contract_type"] == CONTRACT_TYPE_HPHC:
+                        self.data["hphc_fixe_ttc"] = float(row[4].replace(",", "."))
+                        self.data["hphc_variable_hc_ttc"] = float(row[6].replace(",", "."))
+                        self.data["hphc_variable_hp_ttc"] = float(row[8].replace(",", "."))
+                    elif data["contract_type"] == CONTRACT_TYPE_TEMPO:
+                        self.data["tempo_fixe_ttc"] = float(row[4].replace(",", "."))
+                        self.data["tempo_variable_hc_bleu_ttc"] = float(row[6].replace(",", "."))
+                        self.data["tempo_variable_hp_bleu_ttc"] = float(row[8].replace(",", "."))
+                        self.data["tempo_variable_h_similarity0
+                        self.data["tempo_variable_hc_blanc_ttc"] = float(row[10].replace(",", "."))
+                        self.data["tempo_variable_hp_blanc_ttc"] = float(row[12].replace(",", "."))
+                        self.data["tempo_variable_hc_rouge_ttc"] = float(row[14].replace(",", "."))
+                        self.data["tempo_variable_hp_rouge_ttc"] = float(row[16].replace(",", "."))
 
-                    self.data['last_refresh_at'] = dt_util.now()
-
+                    self.data["last_refresh_at"] = dt_util.now()
                     break
-            response.close
 
-        if data['contract_type'] == CONTRACT_TYPE_TEMPO:
+            # close response properly
+            response.close()
+
+        if data["contract_type"] == CONTRACT_TYPE_TEMPO:
             today = dt_util.now().date()
             yesterday = today - timedelta(days=1)
             tomorrow = today + timedelta(days=1)
-            today_str = today.strftime('%Y-%m-%d')
+            today_str = today.strftime("%Y-%m-%d")
 
             try:
                 tempo_yesterday = await self.get_tempo_day(yesterday)
                 tempo_today = await self.get_tempo_day(today)
                 tempo_tomorrow = await self.get_tempo_day(tomorrow)
             except Exception as e:
-                self.logger.error(f"Erreur lors de la récupération des couleurs Tempo: {e}")
-                tempo_yesterday = {'codeJour': 0}
-                tempo_today = {'codeJour': 0}
-                tempo_tomorrow = {'codeJour': 0}
+                self.logger.error("Erreur lors de la récupération des couleurs Tempo: %s", e)
+                tempo_yesterday = {"codeJour": 0}
+                tempo_today = {"codeJour": 0}
+                tempo_tomorrow = {"codeJour": 0}
 
-            yesterday_color = get_tempo_color_from_code(tempo_yesterday['codeJour'])
-            today_color = get_tempo_color_from_code(tempo_today['codeJour'])
-            tomorrow_color = get_tempo_color_from_code(tempo_tomorrow['codeJour'])
-            tomorrow_str = tomorrow.strftime('%Y-%m-%d')
+            yesterday_color = get_tempo_color_from_code(
+                tempo_yesterday.get("codeJour", 0)
+            )
+            today_color = get_tempo_color_from_code(tempo_today.get("codeJour", 0))
+            tomorrow_color = get_tempo_color_from_code(tempo_tomorrow.get("codeJour", 0))
+            tomorrow_str = tomorrow.strftime("%Y-%m-%d")
 
             # Si la couleur d'aujourd'hui est indéterminée, essayer de la résoudre
             # depuis les caches (couleur de demain de la veille, ou couleur déjà résolue)
             if today_color == "indéterminé":
                 # D'abord vérifier si on a déjà résolu la couleur d'aujourd'hui
-                if self.data.get('tempo_aujourdhui_date') == today_str:
-                    cached_today_color = self.data.get('tempo_couleur_aujourdhui')
+                if self.data.get("tempo_aujourdhui_date") == today_str:
+                    cached_today_color = self.data.get("tempo_couleur_aujourdhui")
                     if cached_today_color and cached_today_color != "indéterminé":
-                        self.logger.info(f"Réutilisation de la couleur d'aujourd'hui déjà résolue: {cached_today_color}")
+                        self.logger.info(
+                            "Réutilisation de la couleur d'aujourd'hui déjà résolue: %s",
+                            cached_today_color
+                        )
                         today_color = cached_today_color
                 # Sinon vérifier la couleur de demain connue la veille
-                elif self.data.get('tempo_demain_date') == today_str:
-                    previous_tomorrow_color = self.data.get('tempo_couleur_demain')
+                elif self.data.get("tempo_demain_date") == today_str:
+                    previous_tomorrow_color = self.data.get("tempo_couleur_demain")
                     if previous_tomorrow_color and previous_tomorrow_color != "indéterminé":
-                        self.logger.info(f"Réutilisation de la couleur de demain connue la veille: {previous_tomorrow_color}")
+                        self.logger.info(
+                            "Réutilisation de la couleur de demain connue la veille: %s",
+                            previous_tomorrow_color
+                        )
                         today_color = previous_tomorrow_color
 
             # Si la couleur de demain est indéterminée mais qu'on l'avait déjà
             # récupérée et qu'elle est valide, on réutilise cette valeur du cache
-            if tomorrow_color == "indéterminé" and self.data.get('tempo_demain_date') == tomorrow_str:
-                cached_tomorrow_color = self.data.get('tempo_couleur_demain')
+            if tomorrow_color == "indéterminé" \
+                    and self.data.get("tempo_demain_date") == tomorrow_str:
+                cached_tomorrow_color = self.data.get("tempo_couleur_demain")
                 if cached_tomorrow_color and cached_tomorrow_color != "indéterminé":
-                    self.logger.info(f"Réutilisation de la couleur de demain déjà connue: {cached_tomorrow_color}")
+                    self.logger.info(
+                        "Réutilisation de la couleur de demain déjà connue: %s",
+                        cached_tomorrow_color
+                    )
                     tomorrow_color = cached_tomorrow_color
 
-            self.data['tempo_couleur_hier'] = yesterday_color if yesterday_color != "indéterminé" else None
+            self.data["tempo_couleur_hier"] = yesterday_color if yesterday_color != "indéterminé" else None
             # Ne stocker que les couleurs réelles (pas "indéterminé") pour que les capteurs
             # soient "indisponibles" plutôt que d'afficher une valeur incorrecte
-            self.data['tempo_couleur_aujourdhui'] = today_color if today_color != "indéterminé" else None
+            self.data["tempo_couleur_aujourdhui"] = today_color if today_color != "indéterminé" else None
             # Sauvegarder la couleur résolue d'aujourd'hui pour les mises à jour suivantes
-            self.data['tempo_aujourdhui_date'] = today_str
-            self.data['tempo_couleur_demain'] = tomorrow_color if tomorrow_color != "indéterminé" else None
+            self.data["tempo_aujourdhui_date"] = today_str
+            self.data["tempo_couleur_demain"] = tomorrow_color if tomorrow_color != "indéterminé" else None
             # Stocker la date de demain pour pouvoir la réutiliser après minuit
-            self.data['tempo_demain_date'] = tomorrow_str
+            self.data["tempo_demain_date"] = tomorrow_str
 
             # Sauvegarder le cache Tempo sur disque pour survivre aux redémarrages
             save_cache = False
@@ -322,24 +364,24 @@ class TarifEdfDataUpdateCoordinator(TimestampDataUpdateCoordinator):
                 current_color = yesterday_color
 
             if current_color != "indéterminé":
-                self.data['tempo_couleur'] = current_color
-                self.data['tempo_variable_hp_ttc'] = self.data[f"tempo_variable_hp_{current_color}_ttc"]
-                self.data['tempo_variable_hc_ttc'] = self.data[f"tempo_variable_hc_{current_color}_ttc"]
-                self.data['last_refresh_at'] = dt_util.now()
+                self.data["tempo_couleur"] = current_color
+                self.data["tempo_variable_hp_ttc"] = self.data[f"tempo_variable_hp_{current_color}_ttc"]
+                self.data["tempo_variable_hc_ttc"] = self.data[f"tempo_variable_hc_{current_color}_ttc"]
+                self.data["last_refresh_at"] = dt_util.now()
             else:
                 # Couleur inconnue : vider les clés pour éviter d'afficher des données périmées
-                self.data['tempo_couleur'] = None
-                self.data['tempo_variable_hp_ttc'] = None
-                self.data['tempo_variable_hc_ttc'] = None
+                self.data["tempo_couleur"] = None
+                self.data["tempo_variable_hp_ttc"] = None
+                self.data["tempo_variable_hc_ttc"] = None
 
             # Initialiser les clés de prévision avec des valeurs par défaut
             # pour garantir que les capteurs sont toujours disponibles
             for i in range(TEMPO_FORECAST_DAYS):
                 day_num = i + 1
-                if f'tempo_prevision_j{day_num}_couleur' not in self.data:
-                    self.data[f'tempo_prevision_j{day_num}_couleur'] = 'indéterminé'
-                    self.data[f'tempo_prevision_j{day_num}_probabilite'] = 0
-                    self.data[f'tempo_prevision_j{day_num}_date'] = ''
+                if not self.data.get(f"tempo_prevision_j{day_num}_couleur"):
+                    self.data[f"tempo_prevision_j{day_num}_couleur"] = "indéterminé"
+                    self.data[f"tempo_prevision_j{day_num}_probabilite"] = 0
+                    self.data[f"tempo_prevision_j{day_num}_date"] = ""
 
             # Récupérer les prévisions Tempo (J+1 à J+9)
             try:
@@ -347,44 +389,49 @@ class TarifEdfDataUpdateCoordinator(TimestampDataUpdateCoordinator):
                 if forecast_data:
                     for i, forecast in enumerate(forecast_data[:TEMPO_FORECAST_DAYS]):
                         day_num = i + 1
-                        self.data[f'tempo_prevision_j{day_num}_couleur'] = forecast.get('couleur', 'indéterminé')
-                        self.data[f'tempo_prevision_j{day_num}_probabilite'] = round(forecast.get('probability', 0) * 100)
-                        self.data[f'tempo_prevision_j{day_num}_date'] = forecast.get('date', '')
-                    self.logger.info(f"Prévisions Tempo mises à jour pour {len(forecast_data)} jours")
+                        self.data[f"tempo_prevision_j{day_num}_couleur"] = forecast.get("couleur", "indéterminé")
+                        self.data[f"tempo_prevision_j{day_num}_probabilite"] = round(
+                            forecast.get("probability", 0) * 100
+                        )
+                        self.data[f"tempo_prevision_j{day_num}_date"] = forecast.get("date", "")
+                    self.logger.info("Prévisions Tempo mises à jour pour %d jours", len(forecast_data))
                 else:
                     self.logger.warning("Aucune donnée de prévision Tempo récupérée")
             except Exception as e:
-                self.logger.error(f"Erreur lors du traitement des prévisions Tempo: {e}")
+                self.logger.error("Erreur lors du traitement des prévisions Tempo: %s", e)
 
         default_offpeak_hours = None
-        if data['contract_type'] == CONTRACT_TYPE_TEMPO:
+        if data["contract_type"] == CONTRACT_TYPE_TEMPO:
             default_offpeak_hours = TEMPO_OFFPEAK_HOURS
-        off_peak_hours_ranges = self.config_entry.options.get("off_peak_hours_ranges", default_offpeak_hours)
+        off_peak_hours_ranges = self.config_entry.options.get(
+            "off_peak_hours_ranges", default_offpeak_hours
+        )
 
-        if data['contract_type'] == CONTRACT_TYPE_BASE:
-            self.data['tarif_actuel_ttc'] = self.data['base_variable_ttc']
-        elif data['contract_type'] in [CONTRACT_TYPE_HPHC, CONTRACT_TYPE_TEMPO] and off_peak_hours_ranges is not None:
-            contract_type_key = 'hphc' if data['contract_type'] == CONTRACT_TYPE_HPHC else 'tempo'
-            tarif_actuel = self.data.get(contract_type_key+'_variable_hp_ttc')
+        if data["contract_type"] == CONTRACT_TYPE_BASE:
+            self.data["tarif_actuel_ttc"] = self.data["base_variable_ttc"]
+        elif data["contract_type"] in [CONTRACT_TYPE_HPHC, CONTRACT_TYPE_TEMPO] \
+                and off_peak_hours_ranges is not None:
+            contract_type_key = "hphc" if data["contract_type"] == CONTRACT_TYPE_HPHC else "tempo"
+            tarif_actuel = self.data.get(f"{contract_type_key}_variable_hp_ttc")
             if tarif_actuel is None:
                 # Couleur indéterminée ou données tarifaires pas encore chargées
                 return self.data
             now = dt_util.now().time()
-            for hour_range in off_peak_hours_ranges.split(','):
-                if not re.match(r'([0-1]?[0-9]|2[0-3]):[0-5][0-9]-([0-1]?[0-9]|2[0-3]):[0-5][0-9]', hour_range):
+            for hour_range in off_peak_hours_ranges.split(","):
+                if not re.match(r"([0-1]?[0-9]|2[0-3]):[0-5][0-9]-([0-1]?[0-9]|2[0-3]):[0-5][0-9]", hour_range):
                     continue
 
-                hours = hour_range.split('-')
+                hours = hour_range.split("-")
                 start_at = str_to_time(hours[0])
                 end_at = str_to_time(hours[1])
 
                 if time_in_between(now, start_at, end_at):
-                    tarif_actuel = self.data[contract_type_key+'_variable_hc_ttc']
+                    tarif_actuel = self.data[f"{contract_type_key}_variable_hc_ttc"]
                     break
 
-            self.data['tarif_actuel_ttc'] = tarif_actuel
+            self.data["tarif_actuel_ttc"] = tarif_actuel
 
-        self.logger.info('EDF Tarif')
+        self.logger.info("EDF Tarif")
         self.logger.info(self.data)
 
         return self.data
