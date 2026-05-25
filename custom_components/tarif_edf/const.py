@@ -12,7 +12,7 @@ TARIF_BASE_URL="https://www.data.gouv.fr/fr/datasets/r/c13d05e5-9e55-4d03-bf7e-0
 TARIF_HPHC_URL="https://www.data.gouv.fr/fr/datasets/r/f7303b3a-93c7-4242-813d-84919034c416"
 TARIF_TEMPO_URL="https://www.data.gouv.fr/fr/datasets/r/0c3d1d36-c412-4620-8566-e5cbb4fa2b5a"
 
-TEMPO_COLOR_API_URL="https://www.api-couleur-tempo.fr/api/jourTempo"
+TEMPO_COLOR_API_URL="https://www.api-couleur-tempo.fr/api/jourTempo/today"
 TEMPO_FORECAST_API_URL="https://open-dpe.fr/assets/tempo_days_lite.json"
 TEMPO_COLORS_MAPPING={
     0: "indéterminé",
